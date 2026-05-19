@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use base64::Engine;
-use image::ImageEncoder;
+use image::{AnimationDecoder, ImageDecoder, ImageEncoder};
 
 pub(crate) static DATA_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -362,10 +362,24 @@ async fn process_image_segment(seg: &serde_json::Value) -> Option<serde_json::Va
         })?;
 
     let resp = HTTP.get(url).send().await.ok()?;
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let bytes = resp.bytes().await.ok()?;
 
-    let img = image::load_from_memory(&bytes).ok()?;
-    let modified = modify_edge_pixels(&img);
+    let is_gif = content_type.contains("gif") || bytes.starts_with(b"GIF");
+
+    let modified = if is_gif {
+        info!("transfer: processing GIF image, {} bytes", bytes.len());
+        process_gif_image(&bytes)?
+    } else {
+        let img = image::load_from_memory(&bytes).ok()?;
+        let buf = modify_edge_pixels(&img);
+        buf
+    };
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&modified);
 
@@ -373,6 +387,42 @@ async fn process_image_segment(seg: &serde_json::Value) -> Option<serde_json::Va
         "type": "image",
         "data": { "file": format!("base64://{}", b64) }
     }))
+}
+
+fn process_gif_image(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(bytes);
+    let decoder = image::codecs::gif::GifDecoder::new(cursor).ok()?;
+    let (w, h) = decoder.dimensions();
+
+    let mut frames = Vec::new();
+    for frame in decoder.into_frames() {
+        let frame = frame.ok()?;
+        let img = image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(w, h, frame.buffer().to_vec())?,
+        );
+        let buf = modify_edge_pixels(&img);
+        let modified_img = image::load_from_memory(&buf).ok()?;
+        let delay = frame.delay();
+        let delay_ms = delay.numer_denom_ms();
+        frames.push(image::Frame::from_parts(
+            modified_img.to_rgba8(),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(delay_ms.0, delay_ms.1),
+        ));
+    }
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .ok()?;
+        encoder.encode_frames(frames).ok()?;
+    }
+    Some(buf)
 }
 
 fn modify_edge_pixels(img: &image::DynamicImage) -> Vec<u8> {
