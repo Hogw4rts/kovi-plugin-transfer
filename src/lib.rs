@@ -1,10 +1,14 @@
 mod config;
 
 use config::{Source, Target, TransferRule, load_config, save_config};
+use kovi::bot::runtimebot::CanSendApi;
 use kovi::log::info;
 use kovi::PluginBuilder as plugin;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use base64::Engine;
+use image::ImageEncoder;
 
 pub(crate) static DATA_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -296,71 +300,109 @@ fn build_forward_label(source: &Source, sender_name: &str, user_id: i64) -> Stri
     }
 }
 
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
 async fn send_forward(
     bot: &kovi::RuntimeBot,
     event: &kovi::MsgEvent,
     target: &Target,
     label: &str,
 ) {
-    let mut msg = kovi::Message::new().add_text(label);
+    let mut segments: Vec<serde_json::Value> = match serde_json::to_value(&event.message) {
+        Ok(serde_json::Value::Array(arr)) => arr,
+        _ => return,
+    };
 
-    for seg in &event.message.get("text") {
-        if let Some(text) = seg.data.get("text").and_then(|v| v.as_str()) {
-            if !text.trim().is_empty() {
-                msg = msg.add_text(text);
+    segments.insert(0, serde_json::json!({
+        "type": "text",
+        "data": { "text": label }
+    }));
+
+    for seg in segments.iter_mut() {
+        if seg.get("type").and_then(|v| v.as_str()) == Some("image") {
+            if let Some(modified) = process_image_segment(seg).await {
+                *seg = modified;
             }
         }
     }
 
-    for seg in &event.message.get("image") {
-        if let Some(url) = seg.data.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            msg = msg.add_image(url);
-        } else if let Some(file) = seg.data.get("file").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-            msg = msg.add_image(file);
-        }
-    }
+    let (action, params) = match target {
+        Target::Private { qq } => (
+            "send_private_msg",
+            serde_json::json!({ "user_id": qq, "message": segments, "auto_escape": false }),
+        ),
+        Target::Group { group_id } => (
+            "send_group_msg",
+            serde_json::json!({ "group_id": group_id, "message": segments, "auto_escape": false }),
+        ),
+    };
 
-    for seg in &event.message.get("at") {
-        if let Some(qq) = seg.data.get("qq").and_then(|v| v.as_str()) {
-            msg = msg.add_at(qq);
-        }
-    }
-
-    for seg in &event.message.get("reply") {
-        if let Some(id) = seg.data.get("id") {
-            if let Some(id) = id.as_i64() {
-                msg = msg.add_reply(id as i32);
-            } else if let Some(id) = id.as_str().and_then(|s| s.parse::<i32>().ok()) {
-                msg = msg.add_reply(id);
-            }
-        }
-    }
-
-    for seg in &event.message.get("face") {
-        if let Some(id) = seg.data.get("id") {
-            if let Some(id) = id.as_i64() {
-                msg = msg.add_face(id);
-            } else if let Some(id) = id.as_str().and_then(|s| s.parse::<i64>().ok()) {
-                msg = msg.add_face(id);
-            }
-        }
-    }
+    bot.send_api(action, params);
 
     match target {
         Target::Private { qq } => {
-            bot.send_private_msg(*qq, msg);
-            info!(
-                "transfer: forwarded private {} -> private {}",
-                event.sender.user_id, qq
-            );
+            info!("transfer: forwarded private {} -> private {}", event.sender.user_id, qq);
         }
         Target::Group { group_id } => {
-            bot.send_group_msg(*group_id, msg);
-            info!(
-                "transfer: forwarded -> group {}",
-                group_id
-            );
+            info!("transfer: forwarded -> group {}", group_id);
         }
     }
+}
+
+async fn process_image_segment(seg: &serde_json::Value) -> Option<serde_json::Value> {
+    let data = seg.get("data")?;
+    let url = data
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && (s.starts_with("http://") || s.starts_with("https://")))
+        .or_else(|| {
+            data.get("file")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        })?;
+
+    let resp = HTTP.get(url).send().await.ok()?;
+    let bytes = resp.bytes().await.ok()?;
+
+    let img = image::load_from_memory(&bytes).ok()?;
+    let modified = modify_edge_pixels(&img);
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&modified);
+
+    Some(serde_json::json!({
+        "type": "image",
+        "data": { "file": format!("base64://{}", b64) }
+    }))
+}
+
+fn modify_edge_pixels(img: &image::DynamicImage) -> Vec<u8> {
+    let mut rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut rng = rand::thread_rng();
+
+    for x in 0..w {
+        randomize_pixel(rgba.get_pixel_mut(x, 0), &mut rng);
+        if h > 1 {
+            randomize_pixel(rgba.get_pixel_mut(x, h - 1), &mut rng);
+        }
+    }
+    for y in 1..h.saturating_sub(1) {
+        randomize_pixel(rgba.get_pixel_mut(0, y), &mut rng);
+        if w > 1 {
+            randomize_pixel(rgba.get_pixel_mut(w - 1, y), &mut rng);
+        }
+    }
+
+    let mut buf = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    buf
+}
+
+fn randomize_pixel(pixel: &mut image::Rgba<u8>, rng: &mut impl rand::Rng) {
+    pixel.0[0] = pixel.0[0].wrapping_add(rng.gen_range(0u8..20u8));
+    pixel.0[1] = pixel.0[1].wrapping_add(rng.gen_range(0u8..20u8));
+    pixel.0[2] = pixel.0[2].wrapping_add(rng.gen_range(0u8..20u8));
 }
 
