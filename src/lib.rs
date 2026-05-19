@@ -34,10 +34,7 @@ async fn main() {
             let data_path = data_path.clone();
 
             async move {
-                let text = match event.borrow_text() {
-                    Some(t) => t.trim().to_string(),
-                    None => return,
-                };
+                let text = event.borrow_text().map(|t| t.trim().to_string()).unwrap_or_default();
 
                 let user_id = event.sender.user_id;
 
