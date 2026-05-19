@@ -319,10 +319,38 @@ async fn send_forward(
     }));
 
     for seg in segments.iter_mut() {
-        if seg.get("type").and_then(|v| v.as_str()) == Some("image") {
-            if let Some(modified) = process_image_segment(seg).await {
-                *seg = modified;
+        match seg.get("type").and_then(|v| v.as_str()) {
+            Some("image") => {
+                if let Some(modified) = process_image_segment(seg).await {
+                    *seg = modified;
+                } else if let Some(data) = seg.get("data") {
+                    if let Some(url) = data.get("url").and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        info!("transfer: image mod failed, falling back to CDN URL");
+                        *seg = serde_json::json!({
+                            "type": "image",
+                            "data": { "file": url }
+                        });
+                    }
+                }
             }
+            Some("video") => {
+                if let Some(modified) = process_video_segment(seg).await {
+                    *seg = modified;
+                } else if let Some(data) = seg.get("data") {
+                    if let Some(url) = data.get("url").and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        info!("transfer: video mod failed, falling back to CDN URL");
+                        *seg = serde_json::json!({
+                            "type": "video",
+                            "data": { "file": url }
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -454,5 +482,70 @@ fn randomize_pixel(pixel: &mut image::Rgba<u8>, rng: &mut impl rand::Rng) {
     pixel.0[0] = pixel.0[0].wrapping_add(rng.gen_range(0u8..20u8));
     pixel.0[1] = pixel.0[1].wrapping_add(rng.gen_range(0u8..20u8));
     pixel.0[2] = pixel.0[2].wrapping_add(rng.gen_range(0u8..20u8));
+}
+
+async fn process_video_segment(seg: &serde_json::Value) -> Option<serde_json::Value> {
+    let data = seg.get("data")?;
+    let url = data
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && (s.starts_with("http://") || s.starts_with("https://")))
+        .or_else(|| {
+            data.get("file")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        })?;
+
+    info!("transfer: downloading video for edge modification");
+    let resp = HTTP.get(url).send().await.ok()?;
+    let bytes = resp.bytes().await.ok()?;
+
+    let modified = modify_video_edges(&bytes)?;
+    info!("transfer: video edge modification done, {} bytes -> {} bytes", bytes.len(), modified.len());
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&modified);
+
+    Some(serde_json::json!({
+        "type": "video",
+        "data": { "file": format!("base64://{}", b64) }
+    }))
+}
+
+fn modify_video_edges(input: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let filter = "geq=r='if(eq(X,0)+eq(X,W-1)+eq(Y,0)+eq(Y,H-1),clip(r(X,Y)+random(1)*20-10,0,255),r(X,Y))':g='if(eq(X,0)+eq(X,W-1)+eq(Y,0)+eq(Y,H-1),clip(g(X,Y)+random(1)*20-10,0,255),g(X,Y))':b='if(eq(X,0)+eq(X,W-1)+eq(Y,0)+eq(Y,H-1),clip(b(X,Y)+random(1)*20-10,0,255),b(X,Y))'";
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-i", "pipe:0",
+            "-vf", filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-c:a", "copy",
+            "-movflags", "frag_keyframe+empty_moov",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).ok()?;
+    }
+
+    let output = child.wait_with_output().ok()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        info!("transfer: ffmpeg failed: {}", stderr.lines().last().unwrap_or(""));
+        return None;
+    }
+
+    Some(output.stdout)
 }
 
