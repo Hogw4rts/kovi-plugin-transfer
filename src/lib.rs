@@ -128,6 +128,10 @@ async fn main() {
                     return;
                 }
 
+                if text.starts_with('/') {
+                    return;
+                }
+
                 let self_id = event.self_id;
                 if user_id == self_id {
                     return;
