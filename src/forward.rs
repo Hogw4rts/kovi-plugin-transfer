@@ -131,14 +131,32 @@ async fn forward_combined(
             }
         };
 
-        let Some(messages) = resp.data.get("messages") else {
+        let Some(raw_messages) = resp.data.get("messages").and_then(|v| v.as_array()) else {
             kovi::log::warn!("transfer: no messages in forward {id}");
             continue;
         };
 
+        let nodes: Vec<serde_json::Value> = raw_messages
+            .iter()
+            .filter_map(|msg| {
+                let sender = msg.get("sender")?;
+                let uin = sender.get("user_id").and_then(|v| v.as_i64()).map(|v| v.to_string())?;
+                let name = sender.get("nickname").and_then(|v| v.as_str()).unwrap_or("");
+                let content = msg.get("message")?;
+                Some(serde_json::json!({
+                    "type": "node",
+                    "data": {
+                        "uin": uin,
+                        "name": name,
+                        "content": content
+                    }
+                }))
+            })
+            .collect();
+
         let params = serde_json::json!({
             "group_id": group_id,
-            "messages": messages
+            "messages": nodes
         });
 
         bot.send_api("send_group_forward_msg", params);
