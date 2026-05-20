@@ -161,5 +161,6 @@ async fn forward_combined(
 
         bot.send_api("send_group_forward_msg", params);
         info!("transfer: forwarded combined msg -> group {group_id}");
+        info!("transfer: forwarded combined msg -> group {group_id}");
     }
 }
