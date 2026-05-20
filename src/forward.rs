@@ -65,6 +65,17 @@ async fn send_forward(
         }
     };
 
+    let forward_ids: Vec<String> = segments
+        .iter()
+        .filter(|s| s.get("type").and_then(|v| v.as_str()) == Some("forward"))
+        .filter_map(|s| s.get("data")?.get("id")?.as_str().map(String::from))
+        .collect();
+
+    if !forward_ids.is_empty() {
+        forward_combined(bot, &forward_ids, target).await;
+        return;
+    }
+
     segments.insert(0, serde_json::json!({
         "type": "text",
         "data": { "text": label }
@@ -92,5 +103,45 @@ async fn send_forward(
         Target::Group { group_id } => {
             info!("transfer: forwarded -> group {}", group_id);
         }
+    }
+}
+
+async fn forward_combined(
+    bot: &kovi::RuntimeBot,
+    ids: &[String],
+    target: &Target,
+) {
+    let group_id = match target {
+        Target::Group { group_id } => group_id,
+        _ => {
+            kovi::log::warn!("transfer: combined forward only supports group targets");
+            return;
+        }
+    };
+
+    for id in ids {
+        let resp = match bot
+            .send_api_return("get_forward_msg", serde_json::json!({"message_id": id}))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                kovi::log::warn!("transfer: get_forward_msg failed for {id}: {e}");
+                continue;
+            }
+        };
+
+        let Some(messages) = resp.data.get("messages") else {
+            kovi::log::warn!("transfer: no messages in forward {id}");
+            continue;
+        };
+
+        let params = serde_json::json!({
+            "group_id": group_id,
+            "messages": messages
+        });
+
+        bot.send_api("send_group_forward_msg", params);
+        info!("transfer: forwarded combined msg -> group {group_id}");
     }
 }
