@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub(crate) struct TransferConfig {
     #[serde(default)]
     pub rules: Vec<TransferRule>,
